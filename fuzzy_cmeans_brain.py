@@ -1,19 +1,33 @@
 """
-Fuzzy C-Means for Weighted Graphs with Modularity-Based Community Number Optimization
-======================================================================================
-Designed for functional brain connectivity matrices (e.g., rs-fMRI).
+Fuzzy C-Means for Weighted Brain Functional Connectivity Networks
+=================================================================
+Tailored specifically for ADNI rs-fMRI FC matrices with the format:
+  - CSV: first column = ROI index labels (integers, non-consecutive)
+  - 162 x 162 symmetric Pearson correlation matrix
+  - Region labels 1–169 with 7 missing ROIs (35,36,81,82,133,134,168)
+  - Diagonal = 1.0 (self-correlation), no NaN values
+  - Negative correlations present (range ~ -0.92 to 1.0)
 
-Pipeline:
-    1. Accept a weighted symmetric connectivity matrix W (N x N)
-    2. Find optimal number of communities C via modularity optimization
-    3. Run Fuzzy C-Means on the graph using spectral initialization
-    4. Return membership matrix U (N x C) — rows sum to 1 (valid probability distributions)
-    5. Compute Community Participation Similarity Matrix S_JS using Jensen-Shannon divergence
+Full Pipeline:
+    1.  Load FC matrix from CSV  →  extract ROI labels & data matrix
+    2.  Preprocess               →  Fisher-z, zero diagonal, handle negatives,
+                                    proportional threshold
+    3.  Find optimal C           →  modularity optimization over C_min..C_max
+    4.  Fuzzy C-Means            →  spectral initialization + FCM iterations
+    5.  Membership matrix U      →  (N x C), rows sum to 1
+    6.  S_JS matrix              →  pairwise Jensen-Shannon similarity
+    7.  Bridge node detection    →  membership entropy thresholding
+    8.  Group-level ANOVA        →  FDR-corrected comparison across HC/MCI/AD
+    9.  Visualization            →  6-panel diagnostic figure
 
-Author: Generated for rs-fMRI brain network analysis
+Dependencies:
+    pip install numpy scipy pandas matplotlib statsmodels
+
+Author: Generated for ADNI rs-fMRI Alzheimer's Disease research
 """
 
 import numpy as np
+import pandas as pd
 from scipy.linalg import eigh
 from scipy.spatial.distance import jensenshannon
 import warnings
@@ -21,575 +35,918 @@ warnings.filterwarnings("ignore")
 
 
 # =============================================================================
-# 1. MODULARITY MATRIX & OPTIMIZATION
+# 1.  DATA LOADING
 # =============================================================================
 
-def compute_modularity_matrix(W):
+def load_fc_matrix(filepath, node_number=None):
     """
-    Compute the Newman-Girvan modularity matrix B for a weighted graph.
+    Load one subject's FC matrix from an ADNI-format CSV file.
 
-    B_ij = W_ij - (k_i * k_j) / (2m)
+    CSV format (confirmed from dataset inspection):
+      - Row 0 / Col 0: integer ROI index (e.g., 1..169 with gaps)
+      - Remaining 162 x 162 values: Pearson r, symmetric, diagonal = 1.0
+      - Non-consecutive column labels due to 7 excluded ROIs:
+        35, 36, 81, 82, 133, 134, 168
 
     Parameters
     ----------
-    W : np.ndarray (N x N)
-        Weighted symmetric adjacency matrix (e.g., FC matrix, non-negative).
+    node_number : ٔNumber of expected node that should be in the FC matrix
+    filepath : str
+        Path to the subject CSV file,
+        e.g. 'fc_002_S_0295_2012-05-10.csv'
 
     Returns
     -------
-    B : np.ndarray (N x N)
-        Modularity matrix.
-    m : float
-        Total edge weight (sum of all weights / 2).
+    FC         : np.ndarray (162, 162)  Raw Pearson correlation matrix.
+    roi_labels : list[int]              ROI integer labels in original order,
+                                        e.g. [1,2,...,34,37,...,169].
     """
-    k = W.sum(axis=1)           # weighted degree of each node
-    m = k.sum() / 2.0           # total weight
+    df = pd.read_csv(filepath, index_col=0)
+
+    # Cast index & column labels to int (they come in as strings/floats)
+    df.index   = df.index.astype(int)
+    df.columns = df.columns.astype(int)
+
+    # Sanity check: index and columns must agree
+    assert list(df.index) == list(df.columns), (
+        "Row and column ROI labels do not match — check the CSV format."
+    )
+
+    roi_labels = list(df.index)          # e.g. [1,2,...,34,37,...,169]
+    FC = df.values.astype(np.float64)    # (162, 162)
+
+    if node_number is None:
+        node_number = FC.shape[0]
+
+    assert FC.shape == (node_number, node_number), f"Expected {node_number, node_number} square matrix, but it shape is {FC.shape}."
+
+    # Symmetrize in case of tiny floating-point asymmetry
+    if not np.allclose(FC, FC.T, atol=1e-5):
+        print("[load] Warning: matrix not perfectly symmetric — symmetrizing.")
+        FC = (FC + FC.T) / 2.0
+
+    print(f"[load] {node_number} regions | labels {roi_labels[0]}..{roi_labels[-1]} "
+          f"(7 ROIs excluded) | "
+          f"r ∈ [{FC[~np.eye(node_number, dtype=bool)].min():.3f}, "
+          f"{FC[~np.eye(node_number, dtype=bool)].max():.3f}]")
+
+    return FC, roi_labels
+
+
+def load_subjects(filepaths, node_number):
+    """
+    Load FC matrices for a list of subjects.
+
+    Parameters
+    ----------
+    filepaths : list[str]   One CSV path per subject.
+    node_number : ٔNumber of expected node that should be in the FC matrix
+
+    Returns
+    -------
+    FC_list    : list[np.ndarray]   One (162,162) matrix per subject.
+    roi_labels : list[int]          ROI labels (consistent across subjects).
+    """
+    FC_list, roi_labels = [], None
+    for fp in filepaths:
+        FC, labels = load_fc_matrix(fp, node_number)
+        FC_list.append(FC)
+        if roi_labels is None:
+            roi_labels = labels
+    print(f"[load] Loaded {len(FC_list)} subjects.\n")
+    return FC_list, roi_labels
+
+
+# =============================================================================
+# 2.  PREPROCESSING
+# =============================================================================
+
+def preprocess_fc_matrix(FC, threshold_pct=10,
+                          negative_strategy='zero',
+                          fisher_z=True):
+    """
+    Prepare a raw Pearson FC matrix for weighted graph analysis.
+
+    Steps
+    -----
+    1. **Fisher r-to-z transform** (recommended for Pearson r):
+       z = arctanh(r).  Stabilises variance across the [-1,1] range.
+       Diagonal is zeroed before the transform to avoid arctanh(1) = ∞.
+
+    2. **Zero the diagonal** — self-connections are not meaningful
+       for community detection.
+
+    3. **Handle negative correlations** via `negative_strategy`:
+       - ``'zero'``     : clip negatives to 0.
+                          *Recommended* — FCM and modularity assume
+                          non-negative weights; negative FC edges have
+                          ambiguous community meaning.
+       - ``'absolute'`` : |r| — preserves anti-correlation magnitude.
+       - ``'keep'``     : leave negatives as-is (only valid if your
+                          downstream algorithm supports signed graphs).
+
+    4. **Proportional thresholding**: retain the top `threshold_pct`%
+       of positive edge weights (computed on the upper triangle).
+       Weaker edges are set to 0.  This sparsifies the graph while
+       preserving the strongest functional connections.
+
+    5. **Re-symmetrize** after thresholding.
+
+    Parameters
+    ----------
+    FC                : np.ndarray (N, N)
+        Raw Pearson correlation matrix (diagonal = 1.0).
+    threshold_pct     : float
+        Percentage of strongest positive connections to keep (default 10).
+    negative_strategy : {'zero', 'absolute', 'keep'}
+        How to handle negative correlations.
+    fisher_z          : bool
+        Apply Fisher r-to-z transform (default True).
+
+    Returns
+    -------
+    W        : np.ndarray (N, N)  Processed weighted adjacency matrix.
+    cutoff   : float              Threshold value applied to edge weights.
+    """
+    W = FC.copy()
+    N = W.shape[0]
+
+    # --- Step 1: Fisher r-to-z ---
+    if fisher_z:
+        np.fill_diagonal(W, 0)
+        W = np.clip(W, -0.9999, 0.9999)   # guard against ±1 on diagonal
+        W = np.arctanh(W)
+
+    # --- Step 2: Zero diagonal ---
+    np.fill_diagonal(W, 0)
+
+    # --- Step 3: Handle negatives ---
+    if negative_strategy == 'zero':
+        W = np.clip(W, 0, None)
+    elif negative_strategy == 'absolute':
+        W = np.abs(W)
+    elif negative_strategy == 'keep':
+        pass
+    else:
+        raise ValueError(
+            f"Unknown negative_strategy '{negative_strategy}'. "
+            "Choose 'zero', 'absolute', or 'keep'."
+        )
+
+    # --- Step 4: Proportional threshold on upper triangle ---
+    upper_vals = W[np.triu_indices(N, k=1)]
+    pos_vals   = upper_vals[upper_vals > 0]
+
+    if len(pos_vals) == 0:
+        raise ValueError(
+            "No positive connections remain after preprocessing. "
+            "Try 'absolute' instead of 'zero' for negative_strategy, "
+            "or reduce threshold_pct."
+        )
+
+    cutoff = np.percentile(pos_vals, 100 - threshold_pct)
+    W[W < cutoff] = 0
+
+    # --- Step 5: Re-symmetrize ---
+    W = (W + W.T) / 2.0
+
+    n_edges = int((W > 0).sum() // 2)
+    density = n_edges / (N * (N - 1) / 2)
+    print(f"[preprocess] strategy='{negative_strategy}' | "
+          f"fisher_z={fisher_z} | threshold={threshold_pct}%")
+    print(f"[preprocess] cutoff={cutoff:.4f} | "
+          f"edges={n_edges} | density={density:.3f} | "
+          f"w ∈ [{W[W>0].min():.4f}, {W.max():.4f}]")
+
+    return W, cutoff
+
+
+# =============================================================================
+# 3.  MODULARITY & OPTIMAL C
+# =============================================================================
+
+def _modularity_matrix(W):
+    """
+    Newman-Girvan modularity matrix  B_ij = W_ij - k_i*k_j / (2m).
+
+    Returns B (N,N) and m (total edge weight).
+    """
+    k = W.sum(axis=1)
+    m = k.sum() / 2.0
     if m == 0:
-        raise ValueError("Graph has no edges (all weights are zero).")
-    B = W - np.outer(k, k) / (2 * m)
-    return B, m
+        raise ValueError("Graph has no edges — check preprocessing.")
+    return W - np.outer(k, k) / (2.0 * m), m
 
 
-def compute_modularity_score(W, labels):
+def compute_modularity(W, labels):
     """
-    Compute modularity Q for a hard partition (used to evaluate each C).
+    Modularity Q for a hard-partition vector `labels`.
 
-    Q = (1/2m) * sum_{ij} [W_ij - k_i*k_j/(2m)] * delta(c_i, c_j)
+        Q = (1/2m) Σ_ij B_ij δ(c_i, c_j)
 
     Parameters
     ----------
-    W      : np.ndarray (N x N)  Weighted adjacency matrix.
-    labels : np.ndarray (N,)     Hard community assignment.
+    W      : np.ndarray (N, N)  Weighted adjacency matrix.
+    labels : np.ndarray (N,)    Integer community label per node.
 
     Returns
     -------
-    Q : float   Modularity score in [-0.5, 1].
+    Q : float   Modularity in [-0.5, 1].  Higher = better partition.
     """
-    B, m = compute_modularity_matrix(W)
-    N = len(labels)
-    Q = 0.0
+    B, m = _modularity_matrix(W)
+    N    = len(labels)
+    Q    = 0.0
     for i in range(N):
         for j in range(N):
             if labels[i] == labels[j]:
                 Q += B[i, j]
-    Q /= (2 * m)
-    return Q
+    return Q / (2.0 * m)
 
 
-def find_optimal_C(W, C_min=2, C_max=10, n_runs=5, m=2.0, random_state=42):
+def find_optimal_C(W, C_min=2, C_max=10, n_runs=5,
+                   m_fuzzy=2.0, random_state=42):
     """
-    Find the optimal number of communities C by running FCM for each candidate
-    C and selecting the one that maximizes modularity of the hard partition
-    derived from the fuzzy memberships.
+    Search for the optimal number of communities C by modularity.
+
+    For each C in [C_min, C_max]:
+      1. Run FCM `n_runs` times (different seeds).
+      2. Convert best U to hard labels via argmax.
+      3. Compute Q.
+    Return the C that maximises Q.
 
     Parameters
     ----------
-    W            : np.ndarray (N x N)  Weighted connectivity matrix.
-    C_min        : int                 Minimum number of communities to try.
-    C_max        : int                 Maximum number of communities to try.
-    n_runs       : int                 FCM runs per C (best of n_runs taken).
-    m            : float               FCM fuzziness parameter (default 2.0).
-    random_state : int                 Seed for reproducibility.
+    W            : np.ndarray (N, N)  Preprocessed adjacency matrix.
+    C_min        : int                Lower bound of search.
+    C_max        : int                Upper bound of search.
+    n_runs       : int                FCM restarts per C.
+    m_fuzzy      : float              FCM fuzziness exponent.
+    random_state : int                Base random seed.
 
     Returns
     -------
-    best_C   : int              Optimal number of communities.
-    Q_scores : dict {C: Q}      Modularity score for each C tried.
+    best_C   : int          Optimal C.
+    Q_scores : dict[int,float]  {C: Q} for every C tried.
     """
     rng = np.random.default_rng(random_state)
     Q_scores = {}
 
-    print(f"Searching for optimal C in range [{C_min}, {C_max}]...")
+    print(f"\n[find_C] Searching C ∈ [{C_min}, {C_max}]  "
+          f"({n_runs} runs each) …")
+    print(f"{'C':>4}  {'Q':>10}")
+    print("─" * 18)
+
     for C in range(C_min, C_max + 1):
         best_Q = -np.inf
-        for run in range(n_runs):
-            seed = int(rng.integers(0, 10000))
-            U, _, _ = fuzzy_cmeans_graph(W, C=C, m=m, random_state=seed,
-                                          verbose=False)
-            # Hard partition: assign each node to its dominant community
-            labels = np.argmax(U, axis=1)
-            Q = compute_modularity_score(W, labels)
+        for _ in range(n_runs):
+            seed = int(rng.integers(0, 100_000))
+            U, _, _ = _fcm(W, C=C, m=m_fuzzy,
+                           random_state=seed, verbose=False)
+            Q = compute_modularity(W, np.argmax(U, axis=1))
             if Q > best_Q:
                 best_Q = Q
         Q_scores[C] = best_Q
-        print(f"  C = {C:2d}  →  Q = {best_Q:.4f}")
+        flag = "  ← best" if best_Q == max(Q_scores.values()) else ""
+        print(f"{C:>4}  {best_Q:>10.5f}{flag}")
 
     best_C = max(Q_scores, key=Q_scores.get)
-    print(f"\n✓ Optimal C = {best_C}  (Q = {Q_scores[best_C]:.4f})\n")
+    print(f"\n[find_C] Optimal C = {best_C}  "
+          f"(Q = {Q_scores[best_C]:.5f})\n")
     return best_C, Q_scores
 
 
 # =============================================================================
-# 2. SPECTRAL INITIALIZATION
+# 4.  SPECTRAL INITIALISATION
 # =============================================================================
 
-def spectral_init(W, C, random_state=42):
+def _spectral_embedding(W, C):
     """
-    Initialize FCM cluster centers using the top-C eigenvectors of the
-    normalized Laplacian — more stable than random initialization for graphs.
+    Compute the C-dimensional spectral embedding of the graph.
 
-    Parameters
-    ----------
-    W            : np.ndarray (N x N)  Weighted adjacency matrix.
-    C            : int                 Number of communities.
-    random_state : int
+    Uses the C smallest eigenvectors of the normalised symmetric
+    Laplacian  L = I - D^{-1/2} W D^{-1/2}.
+
+    Row-normalises the result so that FCM distances are scale-invariant.
 
     Returns
     -------
-    centers : np.ndarray (C x N)  Initial cluster centers in feature space.
-    V       : np.ndarray (N x C)  Spectral embedding of nodes.
+    V : np.ndarray (N, C)   One row per node (spectral coordinates).
     """
-    rng = np.random.default_rng(random_state)
-    N = W.shape[0]
+    N  = W.shape[0]
+    d  = W.sum(axis=1)
+    ds = np.where(d > 0, d, 1.0)
+    Di = np.diag(1.0 / np.sqrt(ds))
+    L  = np.eye(N) - Di @ W @ Di
 
-    # Normalized Laplacian: L_sym = I - D^{-1/2} W D^{-1/2}
-    d = W.sum(axis=1)
-    d_safe = np.where(d > 0, d, 1.0)
-    D_inv_sqrt = np.diag(1.0 / np.sqrt(d_safe))
-    L_sym = np.eye(N) - D_inv_sqrt @ W @ D_inv_sqrt
+    # Request C+1 eigenvectors; the smallest (≈ 0) is the trivial one
+    try:
+        _, vecs = eigh(L, subset_by_index=[0, min(C, N - 1)])
+        V = vecs[:, :C]
+    except Exception:
+        _, vecs = eigh(L)
+        V = vecs[:, :C]
 
-    # Smallest C eigenvectors (excluding the trivial zero eigenvalue)
-    eigvals, eigvecs = eigh(L_sym)
-    V = eigvecs[:, :C]  # (N x C) spectral embedding
-
-    # Row-normalize for stability
+    # Row-normalise
     norms = np.linalg.norm(V, axis=1, keepdims=True)
-    norms = np.where(norms > 0, norms, 1.0)
-    V = V / norms
+    V = V / np.where(norms > 1e-10, norms, 1.0)
+    return V
 
-    # K-means++ style center selection in spectral space
-    centers_idx = [int(rng.integers(0, N))]
+
+def _kmeans_pp_centers(V, C, rng):
+    """
+    k-means++ centre selection in spectral space V  (N, C).
+
+    Returns centers_idx : list[int]  — indices of chosen centre nodes.
+    """
+    N = V.shape[0]
+    idx = [int(rng.integers(0, N))]
     for _ in range(C - 1):
         dists = np.array([
-            min(np.linalg.norm(V[i] - V[c]) ** 2 for c in centers_idx)
+            min(np.linalg.norm(V[i] - V[c]) ** 2 for c in idx)
             for i in range(N)
         ])
-        probs = dists / dists.sum()
-        centers_idx.append(int(rng.choice(N, p=probs)))
-
-    centers = V[centers_idx]  # (C x C) in spectral space
-    return centers, V
+        total = dists.sum()
+        probs = dists / total if total > 0 else np.ones(N) / N
+        idx.append(int(rng.choice(N, p=probs)))
+    return idx
 
 
 # =============================================================================
-# 3. FUZZY C-MEANS FOR WEIGHTED GRAPHS
+# 5.  FUZZY C-MEANS (core)
 # =============================================================================
 
-def fuzzy_cmeans_graph(W, C, m=2.0, max_iter=300, tol=1e-6,
-                        random_state=42, verbose=True):
+def _fcm(W, C, m=2.0, max_iter=500, tol=1e-7,
+         random_state=42, verbose=True):
     """
-    Fuzzy C-Means adapted for weighted graphs.
+    Fuzzy C-Means on a weighted graph via spectral embedding.
 
-    Uses the spectral embedding of the graph as the feature space,
-    with the weighted connectivity matrix guiding distance computation.
+    Feature space: N-node graph → (N, C) spectral coordinates V.
 
-    Membership update rule:
-        u_ic = 1 / sum_k [ (d_ic / d_ik)^(2/(m-1)) ]
+    Membership update  (standard FCM):
+        u_ic = (d_ic^{-1/(m-1)}) / Σ_k d_ik^{-1/(m-1)}
 
-    where d_ic is the Euclidean distance from node i's spectral
-    embedding to center c.
+    Centre update:
+        c_k = Σ_i u_ik^m v_i / Σ_i u_ik^m
+
+    Objective (minimised):
+        J = Σ_i Σ_k u_ik^m ||v_i - c_k||²
 
     Parameters
     ----------
-    W            : np.ndarray (N x N)  Weighted symmetric adjacency matrix.
-    C            : int                 Number of communities.
-    m            : float               Fuzziness exponent (m > 1; typically 2).
-    max_iter     : int                 Maximum iterations.
-    tol          : float               Convergence threshold on U change.
+    W            : np.ndarray (N, N)  Non-negative weighted adjacency matrix.
+    C            : int                Number of communities.
+    m            : float              Fuzziness exponent (>1; default 2.0).
+    max_iter     : int                Maximum iterations.
+    tol          : float              Convergence criterion on ||ΔU||.
     random_state : int
     verbose      : bool
 
     Returns
     -------
-    U       : np.ndarray (N x C)  Membership matrix. Rows sum to 1.
-    centers : np.ndarray (C x C)  Final cluster centers in spectral space.
-    history : list of float        Objective function values per iteration.
+    U       : np.ndarray (N, C)   Membership matrix; rows sum to 1.
+    centers : np.ndarray (C, C)   Final cluster centres in spectral space.
+    history : list[float]          Objective J per iteration.
     """
-    N = W.shape[0]
-    assert W.shape == (W.shape[0], W.shape[0]), "W must be square."
-    assert m > 1, "Fuzziness parameter m must be > 1."
+    assert m > 1.0, "Fuzziness m must be > 1."
+    assert C >= 2,  "C must be >= 2."
+
+    N   = W.shape[0]
+    rng = np.random.default_rng(random_state)
+    exp = 1.0 / (m - 1.0)          # exponent for membership formula
 
     # --- Spectral embedding ---
-    centers, V = spectral_init(W, C, random_state=random_state)
+    V = _spectral_embedding(W, C)   # (N, C)
 
-    # --- Initialize membership matrix ---
-    U = _init_membership(N, C, random_state)
+    # --- k-means++ initialisation ---
+    c_idx   = _kmeans_pp_centers(V, C, rng)
+    centers = V[c_idx].copy()       # (C, C)
+
+    # --- Random initial U (will be overwritten in iteration 0 center update) ---
+    U = rng.random((N, C))
+    U = U / U.sum(axis=1, keepdims=True)
 
     history = []
-    exp = 2.0 / (m - 1)
 
-    for iteration in range(max_iter):
-        U_old = U.copy()
+    for it in range(max_iter):
+        U_prev = U.copy()
 
-        # Update centers: c_k = sum_i (u_ik^m * v_i) / sum_i (u_ik^m)
-        Um = U ** m  # (N x C)
-        centers = (Um.T @ V) / (Um.sum(axis=0, keepdims=True).T + 1e-10)  # (C x C)
+        # ── Centre update ──────────────────────────────────────────────
+        Um         = U ** m                                 # (N, C)
+        w_sum      = Um.sum(axis=0)                         # (C,)
+        w_sum      = np.where(w_sum > 1e-12, w_sum, 1e-12)
+        centers    = (Um.T @ V) / w_sum[:, np.newaxis]     # (C, C)
 
-        # Compute distances from each node to each center
-        dists = np.zeros((N, C))
+        # ── Distance: d[i,k] = ||v_i - c_k||² ─────────────────────────
+        D = np.zeros((N, C))
         for k in range(C):
-            diff = V - centers[k]
-            dists[:, k] = np.linalg.norm(diff, axis=1)
+            diff    = V - centers[k]                        # (N, C)
+            D[:, k] = (diff * diff).sum(axis=1)
 
-        # Avoid division by zero: if a node is exactly on a center
-        zero_mask = dists < 1e-10
+        D = np.maximum(D, 1e-12)                            # numerical floor
 
-        # Update memberships
-        U = np.zeros((N, C))
-        for i in range(N):
-            if zero_mask[i].any():
-                # Node exactly on a center: full membership to that center
-                U[i, zero_mask[i]] = 1.0 / zero_mask[i].sum()
-            else:
-                for k in range(C):
-                    ratio = dists[i, k] / (dists[i, :] + 1e-10)
-                    U[i, k] = 1.0 / (ratio ** exp).sum()
+        # ── Membership update ───────────────────────────────────────────
+        # u_ic = D[i,c]^{-exp} / Σ_k D[i,k]^{-exp}
+        inv_D  = D ** (-exp)                                # (N, C)
+        r_sums = inv_D.sum(axis=1, keepdims=True)
+        U      = inv_D / np.where(r_sums > 0, r_sums, 1.0)
 
-        # Normalize rows to sum to 1
-        row_sums = U.sum(axis=1, keepdims=True)
-        U = U / np.where(row_sums > 0, row_sums, 1.0)
-
-        # Objective function: J = sum_{i,k} u_ik^m * d_ik^2
-        J = (Um * (dists ** 2)).sum()
+        # ── Objective ───────────────────────────────────────────────────
+        J = float((U ** m * D).sum())
         history.append(J)
 
-        # Convergence check
-        delta = np.linalg.norm(U - U_old)
-        if verbose and (iteration % 20 == 0 or iteration < 5):
-            print(f"  Iter {iteration:3d} | J = {J:.6f} | ΔU = {delta:.6f}")
+        delta = float(np.linalg.norm(U - U_prev))
+        if verbose and (it < 3 or it % 50 == 0):
+            print(f"  iter {it:4d} | J={J:14.4f} | ΔU={delta:.2e}")
 
         if delta < tol:
             if verbose:
-                print(f"  Converged at iteration {iteration}.")
+                print(f"  Converged at iter {it+1}  (ΔU={delta:.2e})")
             break
+    else:
+        if verbose:
+            print(f"  [warn] max_iter={max_iter} reached (ΔU={delta:.2e})")
+
+    # Final row-normalise (cleanup floating-point drift)
+    r = U.sum(axis=1, keepdims=True)
+    U = U / np.where(r > 0, r, 1.0)
 
     return U, centers, history
 
 
-def _init_membership(N, C, random_state):
-    """Random initialization of membership matrix with rows summing to 1."""
-    rng = np.random.default_rng(random_state)
-    U = rng.random((N, C))
-    U = U / U.sum(axis=1, keepdims=True)
-    return U
-
-
 # =============================================================================
-# 4. COMMUNITY PARTICIPATION SIMILARITY MATRIX (S_JS)
+# 6.  PUBLIC FCM WRAPPER  (best-of-n_runs)
 # =============================================================================
 
-def compute_SJS(U):
+def run_fcm(W, C, m=2.0, n_runs=5, max_iter=500,
+            tol=1e-7, random_state=42, verbose=True):
     """
-    Compute the Community Participation Similarity Matrix S_JS.
-
-    S_JS[i, j] = 1 - sqrt(JS_divergence(u_i, u_j))
-
-    where JS divergence is the Jensen-Shannon divergence between the
-    membership vectors of nodes i and j.
-
-    Since sqrt(JS) is a proper metric, (1 - sqrt(JS)) gives a similarity
-    in [0, 1] where 1 = identical participation profiles.
+    Run FCM `n_runs` times and return the solution with the lowest
+    final objective J (most stable solution).
 
     Parameters
     ----------
-    U : np.ndarray (N x C)  Membership matrix from FCM (rows sum to 1).
-
-    Returns
-    -------
-    S_JS : np.ndarray (N x N)  Symmetric similarity matrix in [0, 1].
-    JS   : np.ndarray (N x N)  Raw JS divergence matrix in [0, 1].
-    """
-    N = U.shape[0]
-    JS = np.zeros((N, N))
-
-    for i in range(N):
-        for j in range(i + 1, N):
-            # jensenshannon returns sqrt(JS divergence) in [0,1]
-            js_dist = jensenshannon(U[i], U[j], base=2)
-            JS[i, j] = js_dist ** 2   # JS divergence
-            JS[j, i] = JS[i, j]
-
-    S_JS = 1.0 - np.sqrt(JS)         # similarity: higher = more similar
-    return S_JS, JS
-
-
-# =============================================================================
-# 5. FULL PIPELINE
-# =============================================================================
-
-def run_pipeline(W, C_min=2, C_max=10, m=2.0, n_runs=5,
-                 random_state=42, verbose=True):
-    """
-    Full pipeline: Weighted FC matrix → Optimal C → FCM → U → S_JS
-
-    Parameters
-    ----------
-    W            : np.ndarray (N x N)  Weighted functional connectivity matrix.
-                   Should be non-negative and symmetric (apply threshold first).
-    C_min        : int    Minimum communities to search.
-    C_max        : int    Maximum communities to search.
-    m            : float  FCM fuzziness (default 2.0).
-    n_runs       : int    FCM runs per C for stability.
+    W            : np.ndarray (N, N)  Preprocessed adjacency matrix.
+    C            : int                Number of communities.
+    m            : float              Fuzziness exponent.
+    n_runs       : int                Number of independent restarts.
+    max_iter     : int
+    tol          : float
     random_state : int
     verbose      : bool
 
     Returns
     -------
-    results : dict with keys:
-        'U'       : np.ndarray (N x C)   Membership matrix
-        'S_JS'    : np.ndarray (N x N)   Similarity matrix
-        'JS'      : np.ndarray (N x N)   Raw JS divergence matrix
-        'C'       : int                  Optimal number of communities
-        'Q_scores': dict {C: Q}          Modularity scores per C
-        'history' : list                 FCM objective history
+    U       : np.ndarray (N, C)   Best membership matrix found.
+    history : list[float]          Objective history of the best run.
     """
-    N = W.shape[0]
-    if verbose:
-        print("=" * 60)
-        print("Fuzzy C-Means for Weighted Brain Networks")
-        print("=" * 60)
-        print(f"Graph size: {N} nodes")
-        print(f"Fuzziness m: {m}")
-        print(f"Searching C in [{C_min}, {C_max}]\n")
-
-    # Step 1: Find optimal C
-    best_C, Q_scores = find_optimal_C(
-        W, C_min=C_min, C_max=C_max,
-        n_runs=n_runs, m=m, random_state=random_state
-    )
-
-    # Step 2: Run final FCM with best C (multiple runs, pick best)
-    if verbose:
-        print(f"Running final FCM with C = {best_C}...")
-    rng = np.random.default_rng(random_state)
-    best_U, best_centers, best_history = None, None, None
-    best_J = np.inf
+    rng     = np.random.default_rng(random_state)
+    best_U, best_hist, best_J = None, None, np.inf
 
     for run in range(n_runs):
-        seed = int(rng.integers(0, 10000))
-        U, centers, history = fuzzy_cmeans_graph(
-            W, C=best_C, m=m, random_state=seed, verbose=verbose
-        )
-        if history[-1] < best_J:
-            best_J = history[-1]
-            best_U = U
-            best_centers = centers
-            best_history = history
-
-    # Step 3: Compute S_JS
-    if verbose:
-        print("\nComputing Community Participation Similarity Matrix (S_JS)...")
-    S_JS, JS = compute_SJS(best_U)
+        seed = int(rng.integers(0, 100_000))
+        U, _, hist = _fcm(W, C=C, m=m, max_iter=max_iter, tol=tol,
+                          random_state=seed,
+                          verbose=(verbose and run == 0))
+        if hist[-1] < best_J:
+            best_J, best_U, best_hist = hist[-1], U, hist
 
     if verbose:
-        print(f"\n✓ Done!")
-        print(f"  Membership matrix U: shape {best_U.shape}")
-        print(f"  S_JS matrix: shape {S_JS.shape}")
-        print(f"  S_JS range: [{S_JS.min():.4f}, {S_JS.max():.4f}]")
-        _print_community_summary(best_U, best_C)
-
-    return {
-        'U': best_U,
-        'S_JS': S_JS,
-        'JS': JS,
-        'C': best_C,
-        'Q_scores': Q_scores,
-        'history': best_history,
-    }
-
-
-def _print_community_summary(U, C):
-    """Print dominant community assignment and entropy for each node."""
-    N = U.shape[0]
-    labels = np.argmax(U, axis=1)
-    entropy = -np.sum(U * np.log2(U + 1e-10), axis=1)
-    max_entropy = np.log2(C)
-
-    print(f"\n  Community summary (C = {C}):")
-    for c in range(C):
-        members = np.where(labels == c)[0]
-        print(f"    Community {c+1}: {len(members)} dominant nodes")
-
-    bridge_thresh = 0.7 * max_entropy
-    bridge_nodes = np.where(entropy > bridge_thresh)[0]
-    print(f"\n  Bridge nodes (entropy > 70% of max): {len(bridge_nodes)} nodes")
-    if len(bridge_nodes) > 0 and len(bridge_nodes) <= 20:
-        print(f"    Node indices: {bridge_nodes.tolist()}")
+        print(f"[fcm] Best J = {best_J:.4f} over {n_runs} runs.\n")
+    return best_U, best_hist
 
 
 # =============================================================================
-# 6. PREPROCESSING UTILITIES
+# 7.  COMMUNITY PARTICIPATION SIMILARITY MATRIX  S_JS
 # =============================================================================
 
-def preprocess_fc_matrix(FC, threshold_pct=10, ensure_nonnegative=True):
+def compute_SJS(U):
     """
-    Preprocess a functional connectivity matrix for graph-based analysis.
+    Build the Community Participation Similarity Matrix S_JS.
 
-    Steps:
-        1. Symmetrize (in case of floating point asymmetry)
-        2. Zero the diagonal
-        3. Optionally clip negative values to 0
-        4. Apply proportional thresholding (keep top threshold_pct% of edges)
+    For each node pair (i, j):
+        JS_ij  = Jensen-Shannon divergence(u_i ‖ u_j)   ∈ [0, 1]
+        d_ij   = sqrt(JS_ij)      (Jensen-Shannon metric, triangle-ineq. holds)
+        S_JS_ij = 1 − d_ij        ∈ [0, 1]   (1 = identical profiles)
+
+    Membership vectors are first clipped to [ε, 1] and renormalised to
+    form valid probability distributions, as required by JS divergence.
 
     Parameters
     ----------
-    FC               : np.ndarray (N x N)  Raw Pearson correlation matrix.
-    threshold_pct    : float   Percentage of strongest connections to keep (default 10%).
-    ensure_nonnegative: bool   Clip negative correlations to 0 (default True).
+    U : np.ndarray (N, C)   Membership matrix; rows should sum to 1.
 
     Returns
     -------
-    W : np.ndarray (N x N)  Processed weighted adjacency matrix.
+    S_JS : np.ndarray (N, N)  Similarity matrix, symmetric, diagonal = 1.
+    JS   : np.ndarray (N, N)  Raw JS divergence, symmetric, diagonal = 0.
     """
-    W = (FC + FC.T) / 2.0          # symmetrize
-    np.fill_diagonal(W, 0)         # remove self-loops
+    N = U.shape[0]
 
-    if ensure_nonnegative:
-        W = np.clip(W, 0, None)    # FCM requires non-negative weights
+    # Sanitise: clip tiny negatives, renormalise rows
+    U_p = np.clip(U, 1e-10, 1.0)
+    U_p = U_p / U_p.sum(axis=1, keepdims=True)
 
-    # Proportional threshold: keep top threshold_pct% of connections
-    if threshold_pct < 100:
-        upper = W[np.triu_indices_from(W, k=1)]
-        cutoff = np.percentile(upper[upper > 0], 100 - threshold_pct)
-        W[W < cutoff] = 0
+    JS   = np.zeros((N, N))
+    S_JS = np.eye(N)          # diagonal = 1 by definition
 
-    return W
+    for i in range(N):
+        for j in range(i + 1, N):
+            # jensenshannon() returns sqrt(JS divergence) in [0, 1]
+            js_metric      = float(jensenshannon(U_p[i], U_p[j], base=2))
+            js_div         = js_metric ** 2
+            JS[i, j]       = JS[j, i] = js_div
+            sim            = 1.0 - js_metric
+            S_JS[i, j]     = S_JS[j, i] = sim
+
+    return S_JS, JS
 
 
 # =============================================================================
-# 7. DEMO / EXAMPLE USAGE
+# 8.  BRIDGE NODE DETECTION
 # =============================================================================
 
-if __name__ == "__main__":
-    import matplotlib
-    matplotlib.use("Agg")
+def detect_bridge_nodes(U, roi_labels=None, threshold_pct=70):
+    """
+    Flag bridge nodes via Shannon entropy of membership vectors.
+
+    A bridge node has membership spread across multiple communities
+    (high entropy).  A core node is concentrated in one community
+    (low entropy).
+
+    Entropy:      H_i   = −Σ_k u_ik log₂ u_ik
+    Max entropy:  H_max =  log₂ C   (uniform across all communities)
+    Threshold:    nodes with H_i > (threshold_pct / 100) × H_max
+
+    Parameters
+    ----------
+    U             : np.ndarray (N, C)   Membership matrix.
+    roi_labels    : list[int] | None    ROI labels for readable output.
+    threshold_pct : float               Entropy % of H_max (default 70).
+
+    Returns
+    -------
+    info : dict with keys
+        'entropy'            np.ndarray (N,)   Entropy per node (bits).
+        'norm_entropy'       np.ndarray (N,)   H_i / H_max  ∈ [0, 1].
+        'is_bridge'          np.ndarray (N,)   Boolean mask.
+        'bridge_indices'     np.ndarray        Integer indices of bridges.
+        'bridge_labels'      list[int]         ROI labels of bridges.
+        'threshold'          float             Entropy threshold used.
+        'dominant_community' np.ndarray (N,)   argmax community per node.
+    """
+    N, C  = U.shape
+    H_max = np.log2(C)
+
+    U_safe  = np.clip(U, 1e-10, 1.0)
+    entropy = -np.sum(U_safe * np.log2(U_safe), axis=1)   # (N,)
+    norm_H  = entropy / H_max
+
+    threshold    = (threshold_pct / 100.0) * H_max
+    is_bridge    = entropy > threshold
+    bridge_idx   = np.where(is_bridge)[0]
+    bridge_lbls  = ([roi_labels[i] for i in bridge_idx]
+                    if roi_labels is not None else [])
+    dominant     = np.argmax(U, axis=1)
+
+    print(f"[bridges] H_max={H_max:.3f} bits | "
+          f"threshold={threshold:.3f} bits ({threshold_pct}%)")
+    print(f"[bridges] Bridge nodes: {is_bridge.sum()} / {N} "
+          f"({100*is_bridge.mean():.1f}%)")
+    if bridge_lbls:
+        print(f"[bridges] ROI labels: {bridge_lbls}")
+
+    return {
+        'entropy':            entropy,
+        'norm_entropy':       norm_H,
+        'is_bridge':          is_bridge,
+        'bridge_indices':     bridge_idx,
+        'bridge_labels':      bridge_lbls,
+        'threshold':          threshold,
+        'dominant_community': dominant,
+    }
+
+
+# =============================================================================
+# 9.  FULL SINGLE-SUBJECT PIPELINE
+# =============================================================================
+
+def run_pipeline(fc_path_or_matrix,
+                 C_min=2, C_max=10,
+                 m=2.0, n_runs=5,
+                 threshold_pct=10,
+                 negative_strategy='zero',
+                 fisher_z=True,
+                 random_state=42,
+                 verbose=True,
+                 node_number=None
+                 ):
+    """
+    End-to-end pipeline for one subject.
+
+    Parameters
+    ----------
+    fc_path_or_matrix : str | np.ndarray
+        Path to a subject CSV file, or a pre-loaded (N,N) FC matrix.
+        If a matrix is passed, roi_labels will be None.
+    C_min, C_max      : int     Community-number search range.
+    m                 : float   FCM fuzziness exponent (default 2.0).
+    n_runs            : int     FCM restarts per C (for stability).
+    threshold_pct     : float   Proportional threshold (keep top X% edges).
+    negative_strategy : str     'zero' | 'absolute' | 'keep'.
+    fisher_z          : bool    Apply Fisher r-to-z transform (recommended).
+    random_state      : int
+    verbose           : bool
+
+    Returns
+    -------
+    results : dict
+        'U'           np.ndarray (N, C)   Membership matrix
+        'S_JS'        np.ndarray (N, N)   Similarity matrix
+        'JS'          np.ndarray (N, N)   JS divergence matrix
+        'W'           np.ndarray (N, N)   Preprocessed adjacency matrix
+        'C'           int                 Optimal number of communities
+        'Q_scores'    dict[int,float]     Modularity per C
+        'roi_labels'  list[int] | None    ROI labels
+        'bridge_info' dict                Bridge-node analysis
+        'history'     list[float]         FCM objective convergence
+    """
+    bar = "=" * 65
+    if verbose:
+        print(f"\n{bar}\nFuzzy C-Means Brain Network Pipeline\n{bar}")
+
+    # ── Load ──────────────────────────────────────────────────────────
+    if isinstance(fc_path_or_matrix, str):
+        FC, roi_labels = load_fc_matrix(fc_path_or_matrix, node_number)
+    else:
+        FC, roi_labels = fc_path_or_matrix.copy(), None
+
+    # ── Preprocess ────────────────────────────────────────────────────
+    W, _ = preprocess_fc_matrix(
+        FC,
+        threshold_pct=threshold_pct,
+        negative_strategy=negative_strategy,
+        fisher_z=fisher_z,
+    )
+
+    # ── Optimal C ─────────────────────────────────────────────────────
+    best_C, Q_scores = find_optimal_C(
+        W, C_min=C_min, C_max=C_max,
+        n_runs=n_runs, m_fuzzy=m,
+        random_state=random_state,
+    )
+
+    # ── Final FCM ─────────────────────────────────────────────────────
+    if verbose:
+        print(f"[fcm] Final run: C={best_C}, m={m}, n_runs={n_runs}")
+    U, history = run_fcm(
+        W, C=best_C, m=m, n_runs=n_runs,
+        random_state=random_state + 1,
+        verbose=verbose,
+    )
+
+    # ── S_JS ──────────────────────────────────────────────────────────
+    if verbose:
+        print("[SJS] Computing Community Participation Similarity Matrix …")
+    S_JS, JS = compute_SJS(U)
+
+    # ── Bridge nodes ──────────────────────────────────────────────────
+    bridge_info = detect_bridge_nodes(U, roi_labels=roi_labels)
+
+    if verbose:
+        N = U.shape[0]
+        print(f"\n{bar}")
+        print(f"Done | N={N} | C={best_C} | "
+              f"bridges={bridge_info['is_bridge'].sum()}")
+        print(f"S_JS ∈ [{S_JS[S_JS<1].min():.4f}, "
+              f"{S_JS[S_JS<1].max():.4f}]")
+        print(bar)
+
+    return {
+        'U':           U,
+        'S_JS':        S_JS,
+        'JS':          JS,
+        'W':           W,
+        'C':           best_C,
+        'Q_scores':    Q_scores,
+        'roi_labels':  roi_labels,
+        'bridge_info': bridge_info,
+        'history':     history,
+    }
+
+
+# =============================================================================
+# 10.  GROUP-LEVEL STATISTICAL ANALYSIS
+# =============================================================================
+
+def group_analysis(SJS_list, group_labels,
+                   roi_labels=None, alpha=0.05):
+    """
+    One-way ANOVA on each S_JS element across diagnostic groups,
+    followed by Benjamini-Hochberg FDR correction.
+
+    Intended use: compare HC vs EMCI vs LMCI vs AD.
+
+    Parameters
+    ----------
+    SJS_list     : list[np.ndarray (N,N)]   One matrix per subject.
+    group_labels : list[str | int]           Group per subject.
+    roi_labels   : list[int] | None          ROI labels for output.
+    alpha        : float                     FDR significance level.
+
+    Returns
+    -------
+    stats : dict
+        'F_matrix'  np.ndarray (N,N)   F-statistic per element.
+        'p_raw'     np.ndarray (N,N)   Uncorrected p-values.
+        'p_fdr'     np.ndarray (N,N)   BH-corrected p-values.
+        'sig_mask'  np.ndarray (N,N)   Boolean (significant after FDR).
+        'sig_pairs' list[tuple]        (roi_i, roi_j, F, p_fdr) tuples.
+    """
+    from scipy.stats import f_oneway
+    try:
+        from statsmodels.stats.multitest import multipletests
+        _sm = True
+    except ImportError:
+        _sm = False
+        print("[anova] statsmodels not found — using Bonferroni correction.\n"
+              "        Install with: pip install statsmodels")
+
+    groups = sorted(set(group_labels))
+    by_grp = {g: [] for g in groups}
+    for mat, grp in zip(SJS_list, group_labels):
+        by_grp[grp].append(mat)
+    for g in groups:
+        by_grp[g] = np.stack(by_grp[g])    # (n_subj, N, N)
+
+    N        = SJS_list[0].shape[0]
+    F_mat    = np.zeros((N, N))
+    p_mat    = np.ones((N, N))
+
+    print(f"[anova] Running one-way ANOVA across {groups} …")
+    for i in range(N):
+        for j in range(i + 1, N):
+            samples = [by_grp[g][:, i, j] for g in groups]
+            if all(len(s) > 1 for s in samples):
+                F, p = f_oneway(*samples)
+                F_mat[i, j] = F_mat[j, i] = F
+                p_mat[i, j] = p_mat[j, i] = p
+
+    # FDR on upper-triangle p-values
+    uidx  = np.triu_indices(N, k=1)
+    p_up  = p_mat[uidx]
+
+    if _sm:
+        _, p_fdr_up, _, _ = multipletests(p_up, alpha=alpha, method='fdr_bh')
+    else:
+        p_fdr_up = np.minimum(p_up * len(p_up), 1.0)   # Bonferroni
+
+    p_fdr               = np.ones((N, N))
+    p_fdr[uidx]         = p_fdr_up
+    p_fdr[uidx[1],uidx[0]] = p_fdr_up      # symmetrise
+
+    sig_mask  = p_fdr < alpha
+    sig_pairs = []
+    for i, j in zip(*np.where(sig_mask & np.triu(np.ones((N,N),bool), k=1))):
+        li = roi_labels[i] if roi_labels else i
+        lj = roi_labels[j] if roi_labels else j
+        sig_pairs.append((li, lj, float(F_mat[i,j]), float(p_fdr[i,j])))
+
+    print(f"[anova] Significant pairs (FDR<{alpha}): "
+          f"{len(sig_pairs)} / {len(uidx[0])}")
+    return {
+        'F_matrix':  F_mat,
+        'p_raw':     p_mat,
+        'p_fdr':     p_fdr,
+        'sig_mask':  sig_mask,
+        'sig_pairs': sig_pairs,
+    }
+
+
+# =============================================================================
+# 11.  VISUALISATION
+# =============================================================================
+
+def visualize_results(results, subject_id=None, save_path=None):
+    """
+    Six-panel diagnostic figure for one subject's pipeline output.
+
+    Panels
+    ------
+    1. Preprocessed FC matrix W
+    2. Modularity Q vs. C  (optimal C marked)
+    3. Membership matrix U  (N × C heat-map)
+    4. S_JS similarity matrix
+    5. Node entropy bar chart  (bridge nodes highlighted)
+    6. FCM objective convergence curve
+
+    Parameters
+    ----------
+    results    : dict   Output of run_pipeline().
+    subject_id : str    Label for figure title (optional).
+    save_path  : str    Save to file if given, else plt.show().
+    """
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
 
-    print("Generating synthetic brain-like connectivity matrix...")
-    rng = np.random.default_rng(42)
-    N = 50   # 50 brain regions (use 116 for AAL atlas)
-
-    # Simulate block-structured FC matrix with overlapping regions
-    true_C = 4
-    block_size = N // true_C
-    FC = rng.random((N, N)) * 0.1   # baseline noise
-    FC = (FC + FC.T) / 2
-
-    # Add community structure
-    for c in range(true_C):
-        start = c * block_size
-        end = min(start + block_size, N)
-        FC[start:end, start:end] += 0.6 + rng.random((end-start, end-start)) * 0.3
-
-    # Add a few bridge nodes with connections to multiple communities
-    for bridge in [block_size - 1, 2 * block_size - 1]:
-        FC[bridge, :block_size*2] += 0.3
-        FC[:block_size*2, bridge] += 0.3
-
-    np.fill_diagonal(FC, 1.0)
-    FC = np.clip(FC, -1, 1)
-
-    # Preprocess
-    print("\nPreprocessing FC matrix...")
-    W = preprocess_fc_matrix(FC, threshold_pct=10)
-
-    # Run full pipeline
-    results = run_pipeline(W, C_min=2, C_max=7, m=2.0, n_runs=3,
-                           random_state=42, verbose=True)
-
-    U    = results['U']
-    S_JS = results['S_JS']
-    C    = results['C']
+    U        = results['U']
+    S_JS     = results['S_JS']
+    W        = results['W']
+    C        = results['C']
     Q_scores = results['Q_scores']
+    history  = results['history']
+    bridge   = results['bridge_info']
+    N        = U.shape[0]
 
-    # -------------------------------------------------------------------------
-    # Visualization
-    # -------------------------------------------------------------------------
-    fig = plt.figure(figsize=(16, 12))
-    fig.patch.set_facecolor('#0f1117')
-    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
+    fig = plt.figure(figsize=(18, 12))
+    fig.patch.set_facecolor('#0d1117')
+    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
 
-    cmap_brain = plt.cm.RdYlBu_r
-    cmap_mem   = plt.cm.viridis
-    cmap_sim   = plt.cm.plasma
-
-    def styled_ax(ax, title):
-        ax.set_facecolor('#1a1d2e')
-        ax.set_title(title, color='white', fontsize=11, pad=10, fontweight='bold')
-        for spine in ax.spines.values():
-            spine.set_edgecolor('#444')
-        ax.tick_params(colors='#aaa', labelsize=8)
+    def sax(ax, title):
+        ax.set_facecolor('#161b22')
+        ax.set_title(title, color='#e6edf3', fontsize=11,
+                     fontweight='bold', pad=10)
+        for sp in ax.spines.values():
+            sp.set_edgecolor('#30363d')
+        ax.tick_params(colors='#8b949e', labelsize=8)
+        ax.xaxis.label.set_color('#8b949e')
+        ax.yaxis.label.set_color('#8b949e')
         return ax
 
-    # 1. Preprocessed FC matrix
-    ax1 = styled_ax(fig.add_subplot(gs[0, 0]), "Preprocessed FC Matrix (W)")
-    im1 = ax1.imshow(W, cmap=cmap_brain, aspect='auto')
-    plt.colorbar(im1, ax=ax1, fraction=0.046).ax.yaxis.set_tick_params(color='white', labelcolor='white')
-    ax1.set_xlabel("Brain Region", color='#aaa', fontsize=8)
-    ax1.set_ylabel("Brain Region", color='#aaa', fontsize=8)
+    def cbar(im, ax):
+        cb = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cb.ax.yaxis.set_tick_params(color='#8b949e', labelcolor='#8b949e')
+        cb.outline.set_edgecolor('#30363d')
 
-    # 2. Modularity scores vs C
-    ax2 = styled_ax(fig.add_subplot(gs[0, 1]), "Modularity Q vs. Number of Communities C")
-    Cs = sorted(Q_scores.keys())
-    Qs = [Q_scores[c] for c in Cs]
-    ax2.plot(Cs, Qs, 'o-', color='#00d4ff', linewidth=2, markersize=8, markerfacecolor='white')
-    ax2.axvline(x=C, color='#ff6b6b', linestyle='--', linewidth=1.5, label=f'Optimal C={C}')
-    ax2.set_xlabel("Number of Communities (C)", color='#aaa', fontsize=9)
-    ax2.set_ylabel("Modularity (Q)", color='#aaa', fontsize=9)
-    ax2.legend(facecolor='#1a1d2e', edgecolor='#444', labelcolor='white', fontsize=9)
+    # 1 — W
+    ax = sax(fig.add_subplot(gs[0, 0]), "Preprocessed FC Matrix  W")
+    im = ax.imshow(W, cmap='RdYlBu_r', aspect='auto')
+    cbar(im, ax)
+    ax.set_xlabel("Region index")
+    ax.set_ylabel("Region index")
 
-    # 3. Membership matrix U
-    ax3 = styled_ax(fig.add_subplot(gs[0, 2]), f"Membership Matrix U (N×{C})")
-    im3 = ax3.imshow(U, cmap=cmap_mem, aspect='auto', vmin=0, vmax=1)
-    plt.colorbar(im3, ax=ax3, fraction=0.046).ax.yaxis.set_tick_params(color='white', labelcolor='white')
-    ax3.set_xlabel("Community", color='#aaa', fontsize=8)
-    ax3.set_ylabel("Brain Region", color='#aaa', fontsize=8)
-    ax3.set_xticks(range(C))
-    ax3.set_xticklabels([f"C{i+1}" for i in range(C)], color='#aaa', fontsize=8)
+    # 2 — Q vs C
+    ax = sax(fig.add_subplot(gs[0, 1]),
+             "Modularity Q vs Number of Communities C")
+    Cs = sorted(Q_scores); Qs = [Q_scores[c] for c in Cs]
+    ax.plot(Cs, Qs, 'o-', color='#58a6ff', lw=2, ms=9,
+            mfc='#0d1117', mew=2)
+    ax.axvline(C, color='#f85149', ls='--', lw=1.5,
+               label=f'Optimal C = {C}')
+    ax.fill_between(Cs, Qs, min(Qs), alpha=0.10, color='#58a6ff')
+    ax.set_xlabel("C"); ax.set_ylabel("Q")
+    ax.set_xticks(Cs)
+    ax.legend(facecolor='#161b22', edgecolor='#30363d',
+              labelcolor='#e6edf3', fontsize=9)
 
-    # 4. S_JS matrix
-    ax4 = styled_ax(fig.add_subplot(gs[1, 0]), "Community Participation Similarity (S_JS)")
-    im4 = ax4.imshow(S_JS, cmap=cmap_sim, aspect='auto', vmin=0, vmax=1)
-    plt.colorbar(im4, ax=ax4, fraction=0.046).ax.yaxis.set_tick_params(color='white', labelcolor='white')
-    ax4.set_xlabel("Brain Region", color='#aaa', fontsize=8)
-    ax4.set_ylabel("Brain Region", color='#aaa', fontsize=8)
+    # 3 — U
+    ax = sax(fig.add_subplot(gs[0, 2]),
+             f"Membership Matrix  U  (N={N}, C={C})")
+    im = ax.imshow(U, cmap='magma', aspect='auto', vmin=0, vmax=1)
+    cbar(im, ax)
+    ax.set_xlabel("Community")
+    ax.set_ylabel("Brain region")
+    ax.set_xticks(range(C))
+    ax.set_xticklabels([f"C{k+1}" for k in range(C)])
 
-    # 5. Membership entropy (bridge node detection)
-    ax5 = styled_ax(fig.add_subplot(gs[1, 1]), "Node Membership Entropy\n(High = Bridge Node)")
-    entropy = -np.sum(U * np.log2(U + 1e-10), axis=1)
-    max_ent = np.log2(C)
-    colors = ['#ff6b6b' if e > 0.7 * max_ent else '#00d4ff' for e in entropy]
-    ax5.bar(range(N), entropy, color=colors, width=0.8, alpha=0.85)
-    ax5.axhline(y=0.7 * max_ent, color='#ff6b6b', linestyle='--',
-                linewidth=1.5, label='Bridge threshold (70% max entropy)')
-    ax5.set_xlabel("Brain Region", color='#aaa', fontsize=8)
-    ax5.set_ylabel("Shannon Entropy (bits)", color='#aaa', fontsize=8)
-    ax5.legend(facecolor='#1a1d2e', edgecolor='#444', labelcolor='white', fontsize=8)
+    # 4 — S_JS
+    ax = sax(fig.add_subplot(gs[1, 0]),
+             "Community Participation Similarity  S_JS")
+    im = ax.imshow(S_JS, cmap='plasma', aspect='auto', vmin=0, vmax=1)
+    cbar(im, ax)
+    ax.set_xlabel("Region index"); ax.set_ylabel("Region index")
 
-    # 6. FCM objective convergence
-    ax6 = styled_ax(fig.add_subplot(gs[1, 2]), "FCM Objective Function Convergence")
-    ax6.plot(results['history'], color='#a8ff78', linewidth=2)
-    ax6.set_xlabel("Iteration", color='#aaa', fontsize=9)
-    ax6.set_ylabel("Objective J", color='#aaa', fontsize=9)
-    ax6.fill_between(range(len(results['history'])), results['history'],
-                     alpha=0.15, color='#a8ff78')
+    # 5 — Entropy / bridge nodes
+    ax  = sax(fig.add_subplot(gs[1, 1]),
+              "Node Entropy  (red = bridge node)")
+    ent = bridge['entropy']
+    thr = bridge['threshold']
+    col = ['#f85149' if b else '#58a6ff' for b in bridge['is_bridge']]
+    ax.bar(range(N), ent, color=col, width=0.8, alpha=0.85)
+    ax.axhline(thr, color='#f85149', ls='--', lw=1.5,
+               label=f"threshold  ({bridge['is_bridge'].sum()} bridges)")
+    ax.set_xlabel("Region index")
+    ax.set_ylabel("Shannon entropy (bits)")
+    ax.legend(facecolor='#161b22', edgecolor='#30363d',
+              labelcolor='#e6edf3', fontsize=9)
 
-    fig.suptitle(
-        f"Fuzzy C-Means Brain Network Analysis  |  Optimal C = {C}  |  N = {N} regions",
-        color='white', fontsize=14, fontweight='bold', y=0.98
-    )
+    # 6 — Convergence
+    ax = sax(fig.add_subplot(gs[1, 2]), "FCM Objective Convergence")
+    ax.plot(history, color='#3fb950', lw=2)
+    ax.fill_between(range(len(history)), history,
+                    min(history), alpha=0.15, color='#3fb950')
+    ax.set_xlabel("Iteration"); ax.set_ylabel("Objective J")
 
-    out_path = "/mnt/user-data/outputs/fuzzy_cmeans_results.png"
-    plt.savefig(out_path, dpi=150, bbox_inches='tight',
-                facecolor=fig.get_facecolor())
-    plt.close()
-    print(f"\nVisualization saved to: {out_path}")
-    print("\nExample: How to use with your real fMRI data:")
-    print("  import numpy as np")
-    print("  from fuzzy_cmeans_brain import preprocess_fc_matrix, run_pipeline")
-    print("  FC = np.load('your_fc_matrix.npy')   # shape (116, 116) for AAL")
-    print("  W  = preprocess_fc_matrix(FC, threshold_pct=10)")
-    print("  results = run_pipeline(W, C_min=2, C_max=10)")
-    print("  U    = results['U']      # membership matrix (116 x C)")
-    print("  S_JS = results['S_JS']   # similarity matrix (116 x 116)")
+    title = "Fuzzy C-Means Brain Network Analysis"
+    if subject_id:
+        title += f"  |  {subject_id}"
+    title += f"  |  C={C}  |  N={N} regions"
+    fig.suptitle(title, color='#e6edf3', fontsize=13,
+                 fontweight='bold', y=0.99)
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight',
+                    facecolor=fig.get_facecolor())
+        print(f"[viz] Saved → {save_path}")
+        plt.close()
+    else:
+        plt.show()
