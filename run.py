@@ -1,15 +1,16 @@
 import numpy as np
 from fuzzy_cmeans_brain import visualize_results, run_pipeline
+import pickle
+import os
 
 # =============================================================================
 # 12.  EXAMPLE USAGE
 # =============================================================================
-
-if __name__ == "__main__":
+def run(data_set:dict, datasets_dir:str, results_dir:str):
 
     # ── Single-subject ──────────────────────────────────────────────────
     results = run_pipeline(
-        fc_path_or_matrix = "fc_002_S_0295_2012-05-10.csv",
+        fc_path_or_matrix= os.path.join(datasets_dir, data_set["dataset"]),
         C_min             = 2,
         C_max             = 10,
         m                 = 2.0,        # standard fuzziness
@@ -28,15 +29,27 @@ if __name__ == "__main__":
     bridges = results['bridge_info']
 
     # Save
-    np.save("U_002_S_0295.npy",   U)
-    np.save("SJS_002_S_0295.npy", S_JS)
+    subject =  data_set["dataset"].removeprefix("fc_").removesuffix(".csv")
+    U_name = f"U_{subject}"
+    # np.save("U_002_S_0295.npy",   U)
+    np.save(os.path.join(results_dir, f'{data_set["algorithm"]}-{U_name}.npy'), U)
+    # np.save("SJS_002_S_0295.npy", S_JS)
+    S_JS_name = f"SJS_{subject}"
+    np.save(os.path.join(results_dir, f'{data_set["algorithm"]}-{S_JS_name}.npy'), S_JS)
+
+    # with open('002_S_0295.pkl', 'wb') as f:
+    with open(os.path.join(results_dir, f'{data_set["algorithm"]}-{subject}.pkl'), 'wb') as f:
+        pickle.dump(results, f)
 
     # Visualise
     visualize_results(
         results,
-        subject_id = "002_S_0295",
-        save_path  = "results_002_S_0295.png",
+        subject_id = subject,
+        save_path=os.path.join(results_dir, f'{data_set["algorithm"]}-{subject}.png'),
+        # save_path  = "results_002_S_0295.png",
     )
+
+    return results
 
     # ── Multi-subject  (uncomment when you have the full cohort) ────────
     #
